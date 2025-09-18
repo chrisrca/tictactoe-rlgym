@@ -4,9 +4,30 @@ from dataclasses import dataclass
 from rlgym.api import RLGym, TransitionEngine, StateMutator, ObsBuilder, ActionParser, RewardFunction, DoneCondition
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_checker import check_env
+from stable_baselines3.common.callbacks import BaseCallback
 import gymnasium as gym
-from gymnasium.spaces import Discrete, Box
+from gymnasium.spaces import Discrete
 import argparse
+import wandb
+
+# Callback for periodic evaluation
+class EvalCallback(BaseCallback):
+    def __init__(self, eval_freq_rollouts, model, env, wandb_run, verbose=1):
+        super(EvalCallback, self).__init__(verbose)
+        self.eval_freq_rollouts = eval_freq_rollouts
+        self.model = model
+        self.env = env
+        self.wandb_run = wandb_run
+        self.rollout_count = 0
+
+    def _on_step(self):
+        return True
+
+    def _on_rollout_end(self):
+        self.rollout_count += 1
+        if self.rollout_count % self.eval_freq_rollouts == 0:
+            print(f"Evaluating model after {self.rollout_count} rollouts...")
+            evaluate_model(self.model, self.env, wandb_run=self.wandb_run)
 
 @dataclass
 class TicTacToeState:
@@ -198,7 +219,7 @@ class RLGymWrapper(gym.Env):
         terminated_bool = bool(terminated[0])
         return obs[0], reward[0], terminated_bool, truncated, info
 
-def evaluate_model(model, env, num_episodes=100):
+def evaluate_model(model, env, num_episodes=100, wandb_run=None):
     wins = 0
     draws = 0
     losses = 0
@@ -216,7 +237,18 @@ def evaluate_model(model, env, num_episodes=100):
                     losses += 1
                 elif reward == 0.0 and not info.get('invalid_move', False):
                     draws += 1
-    print(f"Evaluation: Wins={wins}, Draws={draws}, Losses={losses}, Win Rate={wins/num_episodes:.3f}")
+    total = num_episodes
+    win_rate = wins / total
+    print(f"Evaluation: Wins={wins}, Draws={draws}, Losses={losses}, Win Rate={win_rate:.3f}")
+    
+    # Log to W&B if available
+    if wandb_run:
+        wandb_run.log({
+            "eval/wins": wins,
+            "eval/draws": draws,
+            "eval/losses": losses,
+        })
+    
     return wins, draws, losses
 
 def print_board(board: np.ndarray):
@@ -245,51 +277,86 @@ if __name__ == "__main__":
     parser.add_argument('--train', action='store_true', help="Train the model (default: play mode)")
     args = parser.parse_args()
 
-    # Build RLGym environment (use play_mode=True for play mode)
+    # Build RLGym environment
     env = RLGym(
         state_mutator=TicTacToeMutator(),
         obs_builder=TicTacToeObs(),
         action_parser=TicTacToeActions(),
         reward_fn=TicTacToeReward(),
-        transition_engine=TicTacToeEngine(play_mode=not args.train),  # Disable random opponent in play mode
+        transition_engine=TicTacToeEngine(play_mode=not args.train),
         termination_cond=TicTacToeTerminalCondition(),
         truncation_cond=TicTacToeTruncatedCondition(),
     )
     wrapped_env = RLGymWrapper(env)
 
     if args.train:
+        # W&B
+        config = {
+            "policy_type": "MlpPolicy",
+            "total_timesteps": 300000,
+            "learning_rate": 3e-4,
+            "n_steps": 2048,
+            "batch_size": 64,
+            "n_epochs": 10,
+            "gamma": 0.99,
+            "gae_lambda": 0.95,
+            "clip_range": 0.2,
+            "ent_coef": 0.01,
+            "env": "TicTacToe",
+            "max_steps_per_episode": 10,
+            "eval_episodes": 100,
+        }
+        run = wandb.init(
+            project="tictactoe-rl",
+            config=config,
+            sync_tensorboard=True,
+            save_code=True,
+        )
+
         # Verify environment
         check_env(wrapped_env)
 
         # Initialize PPO model
         model = PPO(
-            "MlpPolicy",
+            config["policy_type"],
             wrapped_env,
             verbose=1,
-            learning_rate=3e-4,
-            n_steps=2048,
-            batch_size=64,
-            n_epochs=10,
-            gamma=0.99,
-            gae_lambda=0.95,
-            clip_range=0.2,
-            ent_coef=0.01,
+            tensorboard_log=f"runs/{run.id}",
+            learning_rate=config["learning_rate"],
+            n_steps=config["n_steps"],
+            batch_size=config["batch_size"],
+            n_epochs=config["n_epochs"],
+            gamma=config["gamma"],
+            gae_lambda=config["gae_lambda"],
+            clip_range=config["clip_range"],
+            ent_coef=config["ent_coef"],
         )
 
         # Evaluate before training
         print("Evaluating untrained model...")
-        evaluate_model(model, wrapped_env)
+        evaluate_model(model, wrapped_env, wandb_run=run)
 
         # Train the model
         print("Starting training...")
-        model.learn(total_timesteps=300000)
+        eval_callback = EvalCallback(
+            eval_freq_rollouts=20,
+            model=model,
+            env=wrapped_env,
+            wandb_run=run,
+        )
+        model.learn(
+            total_timesteps=config["total_timesteps"],
+            callback=eval_callback,
+        )
 
         # Evaluate after training
         print("Evaluating trained model...")
-        evaluate_model(model, wrapped_env)
+        evaluate_model(model, wrapped_env, wandb_run=run)
 
-        # Save the model
+        # Save the final model
         model.save("tictactoe_ppo_model")
+
+        run.finish()
     else:
         # Load the trained model
         print("Loading trained model...")
@@ -303,14 +370,13 @@ if __name__ == "__main__":
         obs, _ = wrapped_env.reset()
         state = wrapped_env.env.transition_engine.state
         done = False
-        print("Welcome to Tic-Tac-Toe! You are O, model is X (goes first). Enter moves 0-8.")
+        print("Tic-Tac-Toe: You are O, model is X (goes first). Enter moves 0-8.")
         print("\nBoard positions:")
         print("0 | 1 | 2")
         print("---------")
         print("3 | 4 | 5")
         print("---------")
         print("6 | 7 | 8")
-        print(f"Initial state.steps: {state.steps}")
 
         while not done:
             # Model's turn (X)
@@ -320,7 +386,6 @@ if __name__ == "__main__":
             state = wrapped_env.env.transition_engine.state
             obs = state.board.astype(np.float32)
             print_board(state.board)
-            print(f"After model move: steps={state.steps}, terminated={terminated}, truncated={truncated}, info={info}")
             winner = check_winner(state.board)
             print(winner)
             done = terminated or truncated
